@@ -3,7 +3,7 @@
     Author:        Hongxin Liang and Jan Wielemaker
     E-mail:        jan@swi-prolog.org
     WWW:           http://www.swi-prolog.org
-    Copyright (c)  2021, SWI-Prolog Solutions b.v.
+    Copyright (c)  2021-2025, SWI-Prolog Solutions b.v.
     All rights reserved.
 
     Redistribution and use in source and binary forms, with or without
@@ -114,7 +114,7 @@ example.
 :- use_module(library(error)).
 :- use_module(library(gensym)).
 :- use_module(library(http/http_stream)).
-:- use_module(library(http/json)).
+:- use_module(library(json)).
 :- use_module(library(readutil)).
 :- use_module(library(socket)).
 :- use_module(library(uuid)).
