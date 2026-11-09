@@ -187,6 +187,17 @@ broker over an untrusted network.
 %     - json_options(+Options)
 %       Options passed to json_read_dict/3 to translate
 %       `application/json` content to Prolog.  Default is `[]`.
+%     - max_header_size(+Size)
+%       Maximum size in characters of the command and header lines of
+%       a received frame.  Default is 1Mb (1,048,576).  If the header
+%       is larger, the connection is closed.
+%     - max_body_size(+Size)
+%       Maximum size of the body of a received frame.  Default is 100Mb
+%       (104,857,600).  If the frame has a ``content-length`` header,
+%       a larger body is skipped and a warning is printed.  Otherwise
+%       the connection is closed.
+%
+%   Both size limits accept `infinite` to remove the limit.
 %
 %   @arg Address is a valid address   for tcp_connect/3. Normally a term
 %   Host:Port, e.g., `localhost:32772`.
@@ -203,6 +214,10 @@ stomp_connection(Address, Host, Headers, Callback, Connection, Options) :-
     option(reconnect(Reconnect), Options, false),
     option(connect_timeout(Timeout), Options, 600),
     option(json_options(JSONOptions), Options, []),
+    option(max_header_size(MaxHeader), Options, 1048576),
+    option(max_body_size(MaxBody), Options, 104857600),
+    must_be(oneof_or_nonneg(infinite), MaxHeader),
+    must_be(oneof_or_nonneg(infinite), MaxBody),
     valid_address(Address),
     must_be(atom, Host),
     must_be(dict, Headers),
@@ -217,8 +232,18 @@ stomp_connection(Address, Host, Headers, Callback, Connection, Options) :-
            headers: Headers,
            reconnect: Reconnect,
            connect_timeout: Timeout,
-           json_options: JSONOptions
+           json_options: JSONOptions,
+           max_header_size: MaxHeader,
+           max_body_size: MaxBody
          }).
+
+:- multifile error:has_type/2.
+error:has_type(oneof_or_nonneg(Atom), X) :-
+    (   X == Atom
+    ->  true
+    ;   integer(X),
+        X >= 0
+    ).
 
 valid_address(Host:Port) :-
     !,
@@ -233,6 +258,9 @@ connection_property(host).
 connection_property(headers).
 connection_property(reconnect).
 connection_property(connect_timeout).
+connection_property(json_options).
+connection_property(max_header_size).
+connection_property(max_body_size).
 
 %!  stomp_connection_property(?Connection, ?Property) is nondet.
 %
@@ -245,6 +273,9 @@ connection_property(connect_timeout).
 %     - headers(Headers)
 %     - reconnect(Bool)
 %     - connect_timeout(Seconds)
+%     - json_options(Options)
+%     - max_header_size(Size)
+%     - max_body_size(Size)
 %       All the above properties result from the stomp_connection/6
 %       registration.
 %     - receiver_thread_id(Thread)
@@ -823,19 +854,29 @@ body_bytes(String, Bytes) :-
 %!  read_frame(+Connection, +Stream, -Frame) is det.
 %
 %   Read a frame from a STOMP stream.   On end-of-file, Frame is unified
-%   with the atom `end_of_file`. Otherwise  it   is  a  dict holding the
-%   `cmd`, `headers` (another dict) and `body` (a string)
+%   with the atom `end_of_file`. If the  body   is  too  large and could
+%   be skipped, Frame is unified with `skipped`.  Otherwise  it   is  a
+%   dict holding the `cmd`, `headers` (another dict) and `body`.
 
 read_frame(Connection, Stream, Frame) :-
-    read_command(Stream, Command),
+    query_connection_property(Connection, max_header_size, MaxHeader),
+    limit(MaxHeader, Limit),
+    read_command(Stream, Command, Limit, Left),
     (   Command == end_of_file
     ->  Frame = end_of_file
     ;   Command == heartbeat
     ->  Frame = stomp_frame{cmd:heartbeat}
-    ;   read_header(Stream, Header),
-        (   has_body(Command)
-        ->  read_content(Connection, Stream, Header, Content),
-            Frame = stomp_frame{cmd:Command, headers:Header, body:Content}
+    ;   read_header(Stream, Header, Left),
+        read_content(Connection, Stream, Header, Content),
+        (   Content == skipped
+        ->  Frame = skipped
+        ;   has_body(Command)
+        ->  (   get_dict('content-type', Header, Type)
+            ->  true
+            ;   Type = "text/plain"
+            ),
+            convert_content(Connection, Type, Content, Body),
+            Frame = stomp_frame{cmd:Command, headers:Header, body:Body}
         ;   Frame = stomp_frame{cmd:Command, headers:Header}
         )
     ).
@@ -844,8 +885,8 @@ has_body(send).
 has_body(message).
 has_body(error).
 
-read_command(Stream, Command) :-
-    read_line_to_string(Stream, String),
+read_command(Stream, Command, Left0, Left) :-
+    read_line_limited(Stream, String, Left0, Left),
     debug(stomp(command), 'Got line ~p', [String]),
     (   String == end_of_file
     ->  Command = end_of_file
@@ -855,24 +896,63 @@ read_command(Stream, Command) :-
         atom_string(Command, Lwr)
     ).
 
-read_header(Stream, Header) :-
-    read_header_lines(Stream, Pairs, []),
+read_header(Stream, Header, Left) :-
+    read_header_lines(Stream, Pairs, [], Left),
     dict_pairs(Header, stomp_header, Pairs).
 
-read_header_lines(Stream, Header, Seen) :-
-    read_line_to_string(Stream, Line),
+read_header_lines(Stream, Header, Seen, Left0) :-
+    read_line_limited(Stream, Line, Left0, Left),
     (   Line == ""
     ->  Header = []
     ;   sub_string(Line, Before, _, After, ":")
     ->  sub_atom(Line, 0, Before, _, Name),
         (   memberchk(Name, Seen)
-        ->  read_header_lines(Stream, Header, Seen)
+        ->  read_header_lines(Stream, Header, Seen, Left)
         ;   sub_string(Line, _, After, 0, Value0),
             convert_value(Name, Value0, Value),
             Header = [Name-Value|More],
-            read_header_lines(Stream, More, [Name|Seen])
+            read_header_lines(Stream, More, [Name|Seen], Left)
         )
     ).
+
+%!  read_line_limited(+Stream, -Line, +Left0, -Left) is det.
+%
+%   Read a line as read_line_to_string/2, but raise a resource error if
+%   more than Left0 characters are read.  Left is the number of
+%   characters left.
+
+read_line_limited(Stream, Line, Left0, Left) :-
+    get_code(Stream, C0),
+    (   C0 == -1
+    ->  Line = end_of_file,
+        Left = Left0
+    ;   read_line_codes(C0, Stream, Codes, Left0, Left),
+        (   append(Codes1, [0'\r], Codes)
+        ->  true
+        ;   Codes1 = Codes
+        ),
+        string_codes(Line, Codes1)
+    ).
+
+read_line_codes(0'\n, _, [], Left, Left) :- !.
+read_line_codes(-1, _, [], Left, Left) :- !.
+read_line_codes(C, Stream, [C|T], Left0, Left) :-
+    Left0 > 0,
+    !,
+    Left1 is Left0 - 1,
+    get_code(Stream, C1),
+    read_line_codes(C1, Stream, T, Left1, Left).
+read_line_codes(_, _, _, _, _) :-
+    resource_error(stomp(max_header_size)).
+
+%!  limit(+Option, -Limit) is det.
+%
+%   Translate a size limit option into a number we can count down.
+
+limit(infinite, Limit) :-
+    !,
+    Limit = 0x3fffffffffffffff.         % large, but fast integer
+limit(Limit, Limit).
 
 convert_value('content-length', String, Bytes) :-
     !,
@@ -913,34 +993,63 @@ unesc(_) --> [C], { syntax_error(invalid_stomp_escape(C)) }.
 
 %!  read_content(+Connection, +Stream, +Header, -Content) is det.
 %
-%   Read the body. If there is a ``content-length`` header, the body has
-%   this length in bytes and must be followed by a NUL byte. Otherwise
-%   the body ends at the first NUL byte. Note that the body  may  be
-%   followed by an arbitrary number of newlines. We leave them in place
-%   to avoid blocking.
+%   Read the body as a string. If there is a ``content-length`` header,
+%   the body has this length in bytes and must be followed by a NUL
+%   byte. Otherwise the body ends at the first NUL byte. Note that the
+%   body may be followed by an arbitrary number of newlines. We leave
+%   them in place to avoid blocking.
+%
+%   If the body exceeds the `max_body_size` and the length is known,
+%   it is skipped and Content is unified with `skipped`.
 
 read_content(Connection, Stream, Header, Content) :-
+    query_connection_property(Connection, max_body_size, MaxBody),
     (   get_dict('content-length', Header, Bytes)
-    ->  setup_call_cleanup(
-            stream_range_open(Stream, DataStream, [size(Bytes)]),
-            read_string(DataStream, _, String),
-            close(DataStream)),
+    ->  (   MaxBody \== infinite,
+            Bytes > MaxBody
+        ->  skip_content(Stream, Bytes),
+            print_message(warning,
+                          stomp(frame_skipped(Connection, Header, MaxBody))),
+            Content = skipped
+        ;   setup_call_cleanup(
+                stream_range_open(Stream, DataStream, [size(Bytes)]),
+                read_string(DataStream, _, Content),
+                close(DataStream))
+        ),
         get_char(Stream, End),
         (   End == '\u0000'
         ->  true
         ;   syntax_error(stomp_frame_not_terminated)
         )
-    ;   read_string(Stream, "\u0000", "", Sep, String),
-        (   Sep == -1
-        ->  syntax_error(stomp_frame_not_terminated)
-        ;   true
-        )
-    ),
-    (   get_dict('content-type', Header, Type)
-    ->  true
-    ;   Type = "text/plain"
-    ),
-    convert_content(Connection, Type, String, Content).
+    ;   limit(MaxBody, Limit),
+        read_to_nul(Stream, Codes, Limit),
+        string_codes(Content, Codes)
+    ).
+
+skip_content(Stream, Bytes) :-
+    setup_call_cleanup(
+        open_null_stream(Null),
+        setup_call_cleanup(
+            stream_range_open(Stream, DataStream, [size(Bytes)]),
+            copy_stream_data(DataStream, Null),
+            close(DataStream)),
+        close(Null)).
+
+read_to_nul(Stream, Codes, Left) :-
+    get_code(Stream, C),
+    read_to_nul(C, Stream, Codes, Left).
+
+read_to_nul(0, _, [], _) :- !.
+read_to_nul(-1, _, _, _) :- !,
+    syntax_error(stomp_frame_not_terminated).
+read_to_nul(C, Stream, [C|T], Left0) :-
+    Left0 > 0,
+    !,
+    Left is Left0 - 1,
+    get_code(Stream, C1),
+    read_to_nul(C1, Stream, T, Left).
+read_to_nul(_, _, _, _) :-
+    resource_error(stomp(max_body_size)).
 
 %!  convert_content(+Connection, +ContentType, +String, -Content) is det.
 %
@@ -985,6 +1094,8 @@ receive(Connection, Stream) :-
     ->  debug(stomp(receive), 'received frame ~p', [Frame]),
         (   Frame == end_of_file
         ->  receive_done(Connection, end_of_file)
+        ;   Frame == skipped
+        ->  receive(Connection, Stream)
         ;   catch_with_backtrace(process_frame(Connection, Frame),
                                  PE, print_message(warning, PE)),
             receive(Connection, Stream)
@@ -1182,7 +1293,13 @@ query_connection_property(Connection, Name, Value) :-
 		 *            MESSAGES		*
 		 *******************************/
 
-:- multifile prolog:error_message//1.
+:- multifile prolog:error_message//1,
+               prolog:message//1.
+
+prolog:message(stomp(frame_skipped(Connection, Header, MaxBody))) -->
+    { connection_property(Connection, address, Address) },
+    [ 'STOMP: ~w: skipped frame with ~D bytes body (max_body_size: ~D)'-
+      [Address, Header.'content-length', MaxBody] ].
 
 prolog:error_message(stomp_error(connect, Connection, error(Message))) -->
     { connection_property(Connection, address, Address) },

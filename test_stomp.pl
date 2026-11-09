@@ -57,6 +57,9 @@ test_stomp :-
 %   with body `"done"`.
 
 with_broker(Frames, Received) :-
+    with_broker(Frames, Received, []).
+
+with_broker(Frames, Received, Options) :-
     message_queue_create(Q),
     tcp_socket(S),
     tcp_bind(S, localhost:Port),
@@ -65,7 +68,7 @@ with_broker(Frames, Received) :-
            ["MESSAGE\ncontent-type:text/plain\ncontent-length:4\n\ndone\u0000\n"],
            AllFrames),
     thread_create(serve(S, AllFrames), Broker, []),
-    stomp_connection(localhost:Port, '/', _{}, collect(Q), C),
+    stomp_connection(localhost:Port, '/', _{}, collect(Q), C, Options),
     call_cleanup(
         ( stomp_connect(C),
           collect(Q, Received)
@@ -131,6 +134,26 @@ test(content_length, R == [disconnected]) :-
 test(wrong_length, R == [disconnected]) :-
     with_broker(["MESSAGE\ncontent-type:text/plain\ncontent-length:1\n\nxy\u0000\n"],
                 R).
+test(receipt, R == [receipt-""]) :-
+    with_broker(["RECEIPT\nreceipt-id:1\n\n\u0000\n"],
+                R).
+test(max_header_size, R == [disconnected]) :-
+    length(L, 200), maplist(=(0'a), L), string_codes(Long, L),
+    format(string(F), "MESSAGE\nx:~s\ncontent-length:1\n\nx\u0000\n", [Long]),
+    with_broker([F], R, [max_header_size(100)]).
+test(max_body_size_skip, R == [message-"small"]) :-
+    with_broker(["MESSAGE\ncontent-type:text/plain\ncontent-length:20\n\n\c
+                  01234567890123456789\u0000\n",
+                  "MESSAGE\ncontent-type:text/plain\ncontent-length:5\n\n\c
+                  small\u0000\n"],
+                R, [max_body_size(10)]).
+test(max_body_size_nolength, R == [disconnected]) :-
+    with_broker(["ERROR\n\n01234567890123456789\u0000\n"],
+                R, [max_body_size(10)]).
+test(infinite, R == [message-"abc", error-"text"]) :-
+    with_broker(["MESSAGE\ncontent-type:text/plain\ncontent-length:3\n\nabc\u0000\n",
+                 "ERROR\n\ntext\u0000\n"],
+                R, [max_header_size(infinite), max_body_size(infinite)]).
 test(escape_header, S == "x\\ny:a\\rb\\c\n") :-
     with_output_to(string(S),
                    stomp:send_header_line(current_output, 'x\ny'-"a\rb:")).
