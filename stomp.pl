@@ -97,6 +97,13 @@ system can be configured to try and keep connecting if the server is not
 available and reconnect if  the  connection   is  lost.  See the pong.pl
 example.
 
+## Security	{#stomp-security}
+
+The connection is a plain TCP connection.  This implies that the
+``login`` and ``passcode`` headers as well as all messages are sent
+unencrypted.  Use a secured network or tunnel when connecting to a
+broker over an untrusted network.
+
 @author Hongxin Liang and Jan Wielemaker
 @license BSD-2
 @see http://stomp.github.io/index.html
@@ -143,7 +150,9 @@ example.
 %   for the `'content-length'` key value which is passed as an integer.
 %
 %   Body  is  a   string   or,   if   the    data   is   of   the   type
-%   ``application/json``, a dict.
+%   ``application/json``, a dict.  If a JSON body cannot be parsed, a
+%   warning is printed and Body is the string.  Note that message
+%   headers and body are under control of the sender of the message.
 %
 %     - connected
 %       A connection was established.  Connection and Header are valid.
@@ -319,7 +328,7 @@ connect_with_deadline(Connection, Address, Stream, Deadline, Options) :-
     between(0, infinite, Retry),
       get_time(Now),
       Timeout is Deadline-Now,
-      (   Now > 0
+      (   Timeout > 0
       ->  (   catch(call_with_time_limit(
                         Timeout,
                         tcp_connect(Address, Stream, Options)),
@@ -335,7 +344,7 @@ connect_with_deadline(Connection, Address, Stream, Deadline, Options) :-
               )
           ;   wait_retry(Connection, failed, Retry, Deadline)
           )
-      ;   throw(stomp_error(connect, Connection, timeout))
+      ;   throw(error(stomp_error(connect, Connection, timeout), _))
       ).
 connect_with_deadline(Connection, Address, Stream, Deadline, Options) :-
     between(0, infinite, Retry),
@@ -767,14 +776,15 @@ send_header(Stream, Headers) :-
     nl(Stream).
 
 send_header_line(Stream, Name-Value) :-
+    escape_value(Name, NameString),
     (   number(Value)
-    ->  format(Stream, '~w:~w\n', [Name,Value])
+    ->  format(Stream, '~w:~w\n', [NameString,Value])
     ;   escape_value(Value, String),
-        format(Stream, '~w:~w\n', [Name,String])
+        format(Stream, '~w:~w\n', [NameString,String])
     ).
 
 escape_value(Value, String) :-
-    split_string(Value, "\n:\\", "", [_]),
+    split_string(Value, "\r\n:\\", "", [_]),
     !,
     String = Value.
 escape_value(Value, String) :-
@@ -866,9 +876,22 @@ read_header_lines(Stream, Header, Seen) :-
 
 convert_value('content-length', String, Bytes) :-
     !,
-    number_string(Bytes, String).
+    (   nonneg_integer_string(String, Bytes)
+    ->  true
+    ;   syntax_error(stomp_content_length(String))
+    ).
 convert_value(_, String, Value) :-
     unescape_header_value(String, Value).
+
+%!  nonneg_integer_string(+String, -Int) is semidet.
+%
+%   True when String only consists of digits that represent Int.
+
+nonneg_integer_string(String, Int) :-
+    string_codes(String, Codes),
+    Codes \== [],
+    forall(member(C, Codes), code_type(C, digit(_))),
+    number_codes(Int, Codes).
 
 unescape_header_value(String, Value) :-
     sub_atom(String, _, _, _, "\\"),
@@ -890,24 +913,64 @@ unesc(_) --> [C], { syntax_error(invalid_stomp_escape(C)) }.
 
 %!  read_content(+Connection, +Stream, +Header, -Content) is det.
 %
-%   Read the body. Note that the body   may  be followed by an arbitrary
-%   number of newlines. We leave them in place to avoid blocking.
+%   Read the body. If there is a ``content-length`` header, the body has
+%   this length in bytes and must be followed by a NUL byte. Otherwise
+%   the body ends at the first NUL byte. Note that the body  may  be
+%   followed by an arbitrary number of newlines. We leave them in place
+%   to avoid blocking.
 
 read_content(Connection, Stream, Header, Content) :-
-    _{ 'content-length':Bytes,
-       'content-type':Type
-     } :< Header,
-    setup_call_cleanup(
-        stream_range_open(Stream, DataStream, [size(Bytes)]),
-        read_content(Connection, Type, DataStream, Header, Content),
-        close(DataStream)).
+    (   get_dict('content-length', Header, Bytes)
+    ->  setup_call_cleanup(
+            stream_range_open(Stream, DataStream, [size(Bytes)]),
+            read_string(DataStream, _, String),
+            close(DataStream)),
+        get_char(Stream, End),
+        (   End == '\u0000'
+        ->  true
+        ;   syntax_error(stomp_frame_not_terminated)
+        )
+    ;   read_string(Stream, "\u0000", "", Sep, String),
+        (   Sep == -1
+        ->  syntax_error(stomp_frame_not_terminated)
+        ;   true
+        )
+    ),
+    (   get_dict('content-type', Header, Type)
+    ->  true
+    ;   Type = "text/plain"
+    ),
+    convert_content(Connection, Type, String, Content).
 
-read_content(Connection, "application/json", Stream, _Header, Content) :-
+%!  convert_content(+Connection, +ContentType, +String, -Content) is det.
+%
+%   Translate a JSON body to a dict.  The body comes from the sender of
+%   the message.  If it is not valid JSON, print a warning and pass the
+%   body as a string rather than losing the connection.
+
+convert_content(Connection, Type, String, Content) :-
+    json_content_type(Type),
     !,
     query_connection_property(Connection, json_options, Options),
-    json_read_dict(Stream, Content, Options).
-read_content(_Connection, _Type, Stream, _Header, Content) :-
-    read_string(Stream, _, Content).
+    catch(setup_call_cleanup(
+              open_string(String, In),
+              ( json_read_dict(In, Content, Options),
+                json_read_dict(In, End, [end_of_file(end_of_file)]),
+                (   End == end_of_file
+                ->  true
+                ;   syntax_error(json(trailing_data))
+                )
+              ),
+              close(In)),
+          Error,
+          ( print_message(warning, Error),
+            Content = String
+          )).
+convert_content(_Connection, _Type, String, String).
+
+json_content_type(Type) :-
+    split_string(Type, ";", " \t", [Main|_]),
+    string_lower(Main, "application/json").
 
 
 %!  receive(+Connection, +Stream) is det.
@@ -922,7 +985,8 @@ receive(Connection, Stream) :-
     ->  debug(stomp(receive), 'received frame ~p', [Frame]),
         (   Frame == end_of_file
         ->  receive_done(Connection, end_of_file)
-        ;   process_frame(Connection, Frame),
+        ;   catch_with_backtrace(process_frame(Connection, Frame),
+                                 PE, print_message(warning, PE)),
             receive(Connection, Stream)
         )
     ;   receive_done(Connection, E)
@@ -1024,16 +1088,16 @@ start_heartbeat(_, _, _).
 
 extract_heartbeats(Heartbeat, X, Y) :-
     split_string(Heartbeat, ",", " ", [XS, YS]),
-    number_string(X, XS),
-    number_string(Y, YS).
+    nonneg_integer_string(XS, X),
+    nonneg_integer_string(YS, Y).
 
 calculate_heartbeats(CX-CY, SX-SY, X-Y) :-
     (   CX =\= 0, SY =\= 0
-    ->  X is max(CX, floor(SY))
+    ->  X is max(CX, SY)
     ;   X = 0
     ),
     (   CY =\= 0, SX =\= 0
-    ->  Y is max(CY, floor(SX))
+    ->  Y is max(CY, SX)
     ;   Y = 0
     ).
 

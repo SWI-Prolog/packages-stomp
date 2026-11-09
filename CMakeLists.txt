@@ -15,3 +15,5 @@ pkg_doc(stomp
 	SOURCE stomp.pl libstomp.tex)
 
 swipl_examples(${STOMP_EXAMPLE_FILES})
+
+test_libs(stomp)
