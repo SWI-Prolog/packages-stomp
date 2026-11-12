@@ -47,7 +47,9 @@ CONNECT frame, replies CONNECTED and sends a canned sequence of frames.
 */
 
 test_stomp :-
-    run_tests([ stomp
+    run_tests([ stomp,
+                stomp_handshake,
+                stomp_headers
               ]).
 
 %!  with_broker(+Frames, -Received) is det.
@@ -154,8 +156,51 @@ test(infinite, R == [message-"abc", error-"text"]) :-
     with_broker(["MESSAGE\ncontent-type:text/plain\ncontent-length:3\n\nabc\u0000\n",
                  "ERROR\n\ntext\u0000\n"],
                 R, [max_header_size(infinite), max_body_size(infinite)]).
+:- end_tests(stomp).
+
+%   The broker may answer CONNECTED before connect_handshake/1 records
+%   the waiting thread.  This was lost, so stomp_connect/1 timed out and
+%   retried against a broker that had already finished.  We delay the
+%   client after sending CONNECT to make sure the receiver sees the
+%   reply first.  The broker must not answer before reading CONNECT:
+%   the receiver thread starts before the handshake.
+
+:- begin_tests(stomp_handshake).
+
+test(early_connected, R == connected) :-
+    tcp_socket(S),
+    tcp_bind(S, localhost:Port),
+    tcp_listen(S, 1),
+    thread_create(serve_handshake(S), Broker, []),
+    stomp_connection(localhost:Port, '/', _{}, ignore_frame, C,
+                     [connect_timeout(5)]),
+    setup_call_cleanup(
+        wrap_predicate(stomp:send_frame(_, Cmd, _), early_connected, W,
+                       ( W, ( Cmd == connect -> sleep(0.5) ; true ) )),
+        catch((stomp_connect(C), R = connected), E, R = E),
+        unwrap_predicate(stomp:send_frame/3, early_connected)),
+    stomp_destroy_connection(C),
+    thread_join(Broker, _),
+    tcp_close_socket(S).
+
+serve_handshake(S) :-
+    tcp_accept(S, C, _),
+    tcp_open_socket(C, Pair),
+    stream_pair(Pair, In, Out),
+    read_string(In, "\u0000", "", _, _), % CONNECT
+    format(Out, "CONNECTED\nversion:1.2\n\n\u0000\n", []),
+    flush_output(Out),
+    read_string(In, "\u0000", "", _, _), % wait for client to close
+    close(Pair, [force(true)]).
+
+ignore_frame(_Cmd, _Conn, _Header, _Body).
+
+:- end_tests(stomp_handshake).
+
+:- begin_tests(stomp_headers).
+
 test(escape_header, S == "x\\ny:a\\rb\\c\n") :-
     with_output_to(string(S),
                    stomp:send_header_line(current_output, 'x\ny'-"a\rb:")).
 
-:- end_tests(stomp).
+:- end_tests(stomp_headers).

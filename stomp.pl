@@ -502,20 +502,24 @@ stomp_deadline_connect(Connection, Deadline, Options) :-
           wait_retry(Connection, failed, Retry, Deadline)
       ).
 
+%   The receiver thread may process the CONNECTED reply before
+%   send_frame/3 returns, so we must register the waiting thread and
+%   the heart-beat before sending CONNECT.
+
 connect_handshake(Connection) :-
     query_connection_property(Connection, headers, Headers),
     query_connection_property(Connection, host, Host),
-    send_frame(Connection,
-               connect,
-               Headers.put(_{ 'accept-version':'1.0,1.1,1.2',
-                              host:Host
-                            })),
     (   Heartbeat = Headers.get('heart-beat')
     ->  update_connection_property(Connection, 'heart-beat', Heartbeat)
     ;   true
     ),
     thread_self(Self),
     update_connection_property(Connection, waiting_thread, Self),
+    send_frame(Connection,
+               connect,
+               Headers.put(_{ 'accept-version':'1.0,1.1,1.2',
+                              host:Host
+                            })),
     (   thread_get_message(Self, stomp(connected(Connection, Status)),
                            [timeout(10)])
     ->  (   Status == true
@@ -523,7 +527,8 @@ connect_handshake(Connection) :-
             update_connection_property(Connection, connected, Now)
         ;   throw(error(stomp_error(connect, Connection, Status), _))
         )
-    ;   throw(error(stomp_error(connect, Connection, timeout), _))
+    ;   retractall(connection_property(Connection, waiting_thread, _)),
+        throw(error(stomp_error(connect, Connection, timeout), _))
     ).
 
 wait_connected(Connection) :-
